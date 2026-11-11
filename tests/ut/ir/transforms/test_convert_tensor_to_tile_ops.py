@@ -8845,5 +8845,27 @@ def test_added_output_rebinds_omitted_original_out_storage():
     ir.assert_structural_equal(statement.expr.type.types[0], output_type)
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_cross_broadcast_materializes_both_vector_expansions(reverse):
+    """[1,N] * [M,1] cannot use a row-expand requiring equal row counts."""
+    shapes = [[1, 64], [32, 1]]
+    if reverse:
+        shapes.reverse()
+    before = _make_before(
+        in_specs=[("lhs", shapes[0], DataType.FP32), ("rhs", shapes[1], DataType.FP32)],
+        out_shape=[32, 64],
+        out_dtype=DataType.FP32,
+        body=lambda ib, ins: ib.let("z", tensor_ops.mul(ins[0], ins[1])),
+    )
+    after = passes.convert_tensor_to_tile_ops()(before)
+    kernel = _require_function(after, "main_incore_0")
+    call = _find_first_call_to(kernel, "tile.mul")
+    assert call is not None
+    assert [d.value for d in call.type.shape] == [32, 64]
+    assert _find_first_call_to(kernel, "tile.row_expand_mul") is None
+    assert _find_first_call_to(kernel, "tile.row_expand") is not None
+    assert _find_first_call_to(kernel, "tile.col_expand") is not None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -18,15 +18,32 @@ fixes the expected operation count for the first workload.
 
 ## 2. Make interpretation preserve dataflow
 
-The interpreter needs scalar arithmetic, loops, loop-carried values, branches
-and tile functional evaluation. When a branch reads a tile result, that value
-must be available during recording.
+The interpreter separates scalar/control execution and tile semantics from optional
+numerical handlers. Trace-only execution uses input descriptions and requires no tile
+payloads. A payload-dependent branch or instruction parameter must be concrete;
+unknown values report their originating operation instead of guessing a path.
 
 The main bookkeeping issue is object identity. A view shares storage with its
 source; accumulation reads and writes related state; a reused address can hold
 a new object generation. The trace must retain these relationships and the
 actual accessed ranges. The first tests should cover accumulation, overlapping
 views, strided/tail accesses and address reuse.
+
+The first CPU interpreter now covers control flow, accumulator versions,
+independent load/move copies, non-contiguous inputs and tail rectangles. Pure
+TensorSpec inputs capture the 13/21-operation matmul checkpoints with the same
+versions and dependencies as functional mode; see the [implemented API](a8-plan.md#available-cpu-interpreter).
+The registry now also covers the vector arithmetic, cast, reductions and row broadcasts
+needed by softmax and two-block FlashAttention, plus compiler-generated move layouts.
+Seven compiled workspace probes capture complete traces at both Tile checkpoints;
+these newly described vector operations still lack numerical handlers.
+Internal slice/reshape views now share storage versions; binary broadcasts and integer/boolean
+descriptors are supported. A further 14 probes cover views, RMSNorm, masks and Vec gather.
+Separately supplied overlapping inputs, physical address reuse and timing hazards remain open.
+
+The next 20 probes add tail arithmetic, optional scratch, saturating cast attributes,
+non-affine logical reshape maps, insertion/concatenation, reductions and transpose views.
+Cross broadcasting is expanded during Tensor-to-Tile conversion before layout lowering.
 
 ## 3. Turn tile operations into timing work
 

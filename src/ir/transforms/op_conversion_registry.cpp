@@ -85,6 +85,13 @@ std::pair<int, int> DetectRowBroadcast(const std::vector<ExprPtr>& args) {
   if (!type0 || !type1) return {-1, -1};
   if (type0->shape_.size() != 2 || type1->shape_.size() != 2) return {-1, -1};
 
+  // Row-expand has no broadcasting on the row axis. A cross broadcast such
+  // as [1, N] * [M, 1] must stay a generic binary op for later expansion;
+  // choosing row_expand here would fail its type contract before that pass.
+  if (!tile_view_semantics::ShapeExprListsEquivalent({type0->shape_[0]}, {type1->shape_[0]})) {
+    return {-1, -1};
+  }
+
   bool rhs_is_col_vec = IsConstOne(type1->shape_[1]) && !IsConstOne(type0->shape_[1]);
   bool lhs_is_col_vec = IsConstOne(type0->shape_[1]) && !IsConstOne(type1->shape_[1]);
 
@@ -109,6 +116,37 @@ VarPtr AppendScratchTile(std::vector<StmtPtr>* prologue, const std::shared_ptr<c
   auto tmp_var = std::make_shared<Var>(name, create_call->GetType(), span);
   prologue->push_back(std::make_shared<AssignStmt>(tmp_var, create_call, span));
   return tmp_var;
+}
+
+// Neither row-expand arithmetic nor the later flat-vector layout rewrite can
+// directly consume [1,N] op [M,1]. Materialize each vector's broadcast first,
+// preserving operand order for noncommutative operations as well.
+std::vector<ExprPtr> ExpandCrossBroadcast(const std::vector<ExprPtr>& args, std::vector<StmtPtr>* prologue,
+                                          const Span& span) {
+  if (args.size() != 2) return args;
+  auto lhs = As<TileType>(args[0]->GetType());
+  auto rhs = As<TileType>(args[1]->GetType());
+  if (!lhs || !rhs || lhs->shape_.size() != 2 || rhs->shape_.size() != 2) return args;
+  const bool lhs_row = IsConstOne(lhs->shape_[0]) && !IsConstOne(lhs->shape_[1]);
+  const bool rhs_row = IsConstOne(rhs->shape_[0]) && !IsConstOne(rhs->shape_[1]);
+  const bool lhs_col = IsConstOne(lhs->shape_[1]) && !IsConstOne(lhs->shape_[0]);
+  const bool rhs_col = IsConstOne(rhs->shape_[1]) && !IsConstOne(rhs->shape_[0]);
+  if (!(lhs_row && rhs_col) && !(rhs_row && lhs_col)) return args;
+  const std::vector<ExprPtr> shape = {lhs_col ? lhs->shape_[0] : rhs->shape_[0],
+                                      lhs_row ? lhs->shape_[1] : rhs->shape_[1]};
+  auto& reg = OpRegistry::GetInstance();
+  std::vector<ExprPtr> expanded;
+  const std::vector<std::shared_ptr<const TileType>> types = {lhs, rhs};
+  for (size_t i = 0; i < args.size(); ++i) {
+    auto model = std::make_shared<TileType>(shape, types[i]->dtype_);
+    auto target = AppendScratchTile(prologue, model, "cross_shape_" + std::to_string(i), span);
+    const bool row = i == 0 ? lhs_row : rhs_row;
+    auto call = reg.Create(row ? "tile.col_expand" : "tile.row_expand", {target, args[i]}, span);
+    auto output = std::make_shared<Var>("cross_expanded_" + std::to_string(i), call->GetType(), span);
+    prologue->push_back(std::make_shared<AssignStmt>(output, call, span));
+    expanded.push_back(output);
+  }
+  return expanded;
 }
 
 ConversionResult ConvertFlatGather(const std::vector<ExprPtr>& args, const Span& span,
@@ -481,6 +519,7 @@ void OpConversionRegistry::RegisterElementwiseBinaryOps() {
         }
       }
 
+      converted_args = ExpandCrossBroadcast(converted_args, &prologue, span);
       auto [wider, narrower] = DetectRowBroadcast(converted_args);
       if (wider >= 0) {
         if (enforce_tdiv_contract) {
@@ -522,16 +561,9 @@ void OpConversionRegistry::RegisterElementwiseBinaryOps() {
         return ConversionResult{std::move(prologue), row_expand_call};
       }
 
-      if (enforce_tdiv_contract) {
-        auto div_call = kwargs.empty() ? op_reg.Create(tile_op, converted_args, span)
-                                       : op_reg.Create(tile_op, converted_args, kwargs, span);
-        return ConversionResult{std::move(prologue), div_call};
-      }
-
-      if (kwargs.empty()) {
-        return ConversionResult{op_reg.Create(tile_op, args, span)};
-      }
-      return ConversionResult{op_reg.Create(tile_op, args, kwargs, span)};
+      auto binary_call = kwargs.empty() ? op_reg.Create(tile_op, converted_args, span)
+                                        : op_reg.Create(tile_op, converted_args, kwargs, span);
+      return ConversionResult{std::move(prologue), binary_call};
     };
   };
 
