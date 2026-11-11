@@ -272,8 +272,8 @@ nav:
   - Developer:
       - en/dev/index.md
       - en/dev/00-ecosystem.md
-      - en/dev/workload/a8-plan.md
-      - en/dev/workload/a8-gaps.md
+      - en/dev/workload/plan.md
+      - en/dev/workload/gaps.md
       - en/dev/01-compile-profiling.md
       - en/dev/08-artifact-identity.md
       - en/dev/09-artifact-store.md

@@ -22,8 +22,8 @@ PyPTO programs, start with the [User Manual](../user/index.md).
 | Page | What it covers |
 | ---- | -------------- |
 | [PTO Project Ecosystem](00-ecosystem.md) | The multi-repo toolchain — PyPTO, PTOAS, pto-isa, simpler, pypto-lib — and how they fit together |
-| [pypto4A8 Workload Plan](workload/a8-plan.md) | CPU trace generation and tile-level replay for WSE + superscalarNPU |
-| [pypto4A8 Integration Questions](workload/a8-gaps.md) | Trace normalization, PE modeling, and Calendar communication adaptation |
+| [PyPTO Workload Plan](workload/plan.md) | CPU trace generation and tile-level replay for WSE + superscalarNPU |
+| [PyPTO Integration Questions](workload/gaps.md) | Trace normalization, PE modeling, and Calendar communication adaptation |
 | [Compile Profiling](01-compile-profiling.md) | Built-in wall-clock timing of the compilation pipeline |
 | [Error Handling](02-error-handling.md) | `CHECK` vs `INTERNAL_CHECK`, PyPTO exception types, IR source locations in failures |
 | [Logging](03-logging.md) | The two independent logging subsystems and which one a message came from |

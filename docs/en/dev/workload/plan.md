@@ -1,4 +1,4 @@
-# pypto4A8 workload plan
+# PyPTO workload plan
 
 Design notes · 2026-11-11 · CPU interpreter implemented; timing replay planned
 
@@ -98,7 +98,7 @@ Development lives on the fork's `dev_workload` branch. The CPU interpreter lives
 and generated artifacts live in the enclosing workspace's
 `workspace/matmul-tile-ir/` directory.
 
-The concrete questions to resolve are collected in [integration gaps](a8-gaps.md).
+The concrete questions to resolve are collected in [integration gaps](gaps.md).
 
 ## Available CPU interpreter
 

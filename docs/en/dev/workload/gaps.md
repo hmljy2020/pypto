@@ -1,8 +1,8 @@
-# pypto4A8 integration questions
+# PyPTO integration questions
 
 Design notes · 2026-11-11
 
-The [workload plan](a8-plan.md) is organized around target adaptation, CPU
+The [workload plan](plan.md) is organized around target adaptation, CPU
 interpretation and timing replay. The following questions guide implementation.
 
 ## 1. Define the target meaning of early Tile IR
@@ -32,7 +32,7 @@ views, strided/tail accesses and address reuse.
 The first CPU interpreter now covers control flow, accumulator versions,
 independent load/move copies, non-contiguous inputs and tail rectangles. Pure
 TensorSpec inputs capture the 13/21-operation matmul checkpoints with the same
-versions and dependencies as functional mode; see the [implemented API](a8-plan.md#available-cpu-interpreter).
+versions and dependencies as functional mode; see the [implemented API](plan.md#available-cpu-interpreter).
 The registry now also covers the vector arithmetic, cast, reductions and row broadcasts
 needed by softmax and two-block FlashAttention, plus compiler-generated move layouts.
 Seven compiled workspace probes capture complete traces at both Tile checkpoints;

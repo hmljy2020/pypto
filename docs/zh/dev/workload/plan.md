@@ -1,4 +1,4 @@
-# pypto4A8 workload 方案
+# PyPTO workload 方案
 
 设计笔记 · 2026-11-11 · CPU 解释器已实现，时间回放待实现
 
@@ -79,7 +79,7 @@ store acc3 -> C
 单元测试位于 `tests/ut/workload/`，系统测试规划在 `tests/st/workload/`；模型侧负责调度和计时。
 临时示例与生成产物放在外层工作区的 `workspace/matmul-tile-ir/`。
 
-具体需要解决的问题见[适配问题笔记](a8-gaps.md)。
+具体需要解决的问题见[适配问题笔记](gaps.md)。
 
 ## 已实现的 CPU 解释器
 
