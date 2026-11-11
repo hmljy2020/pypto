@@ -20,6 +20,8 @@ PyPTO 的构成：IR、pass 流水线、代码生成，以及围绕它们的基�
 | 页面 | 内容 |
 | ---- | ---- |
 | [PTO 项目生态](00-ecosystem.md) | 多仓库工具链 —— PyPTO、PTOAS、pto-isa、simpler、pypto-lib —— 及其组合方式 |
+| [pypto4A8 Workload 方案](workload/a8-plan.md) | 面向 WSE + superscalarNPU 的 CPU trace 生成与 tile 级回放 |
+| [pypto4A8 适配缺口](workload/a8-gaps.md) | Trace 规范化、PE 建模和 Calendar 通信适配 |
 | [编译性能剖析](01-compile-profiling.md) | 内建的编译流水线墙钟计时 |
 | [错误处理](02-error-handling.md) | `CHECK` 与 `INTERNAL_CHECK`、PyPTO 异常类型、失败信息中的 IR 源码位置 |
 | [日志](03-logging.md) | 两套相互独立的日志子系统，以及如何判断一条消息来自哪一套 |
