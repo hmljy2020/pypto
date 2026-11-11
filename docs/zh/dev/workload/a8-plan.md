@@ -75,7 +75,7 @@ store acc3 -> C
 及其周围标量/控制流的适配与解释执行。将矩阵乘 trace 对接计时回放后，
 扩展视图、尾块和 vector 操作，再推进多 PE 与 WSE Calendar 通信。
 
-开发使用 fork 的 `pypto4A8` 分支。CPU 解释器代码位于 `python/pypto/workload/`，
+开发使用 fork 的 `dev_workload` 分支。CPU 解释器代码位于 `python/pypto/workload/`，
 单元测试位于 `tests/ut/workload/`，系统测试规划在 `tests/st/workload/`；模型侧负责调度和计时。
 临时示例与生成产物放在外层工作区的 `workspace/matmul-tile-ir/`。
 

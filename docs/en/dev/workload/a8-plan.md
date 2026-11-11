@@ -92,7 +92,7 @@ matmul_acc and their surrounding scalar/control expressions. Connect the matmul
 trace to timing replay, then extend to views, partial tiles and vector operations.
 Multi-PE execution and WSE Calendar communication follow this first working path.
 
-Development lives on the fork's `pypto4A8` branch. The CPU interpreter lives in
+Development lives on the fork's `dev_workload` branch. The CPU interpreter lives in
 `python/pypto/workload/`, with tests in `tests/ut/workload/` and
 `tests/st/workload/` (planned system coverage). The model owns scheduling and timing. Temporary examples
 and generated artifacts live in the enclosing workspace's
