@@ -272,6 +272,7 @@ nav:
   - Developer:
       - en/dev/index.md
       - en/dev/00-ecosystem.md
+      - en/dev/workload/design.md
       - en/dev/workload/plan.md
       - en/dev/workload/gaps.md
       - en/dev/01-compile-profiling.md

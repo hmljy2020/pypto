@@ -1,6 +1,11 @@
 # PyPTO workload plan
 
-Design notes · 2026-11-12 · CPU interpreter and multicore capture implemented; timing replay planned
+The current approach is described in [SSNPU workload design notes](design.md):
+handwritten extended Tile IR with explicit blocks/threads, shared storage and
+source lifetimes. The sections below retain the existing PyPTO operator import
+path and interpreter implementation record as reusable foundations.
+
+Design notes · 2026-11-12 · CPU interpreter, multicore and handwritten SSNPU capture implemented; timing replay planned
 
 The goal is to turn PyPTO operators into workloads for a WSE system with
 superscalarNPU cores. The first milestone is a single-thread, single-PE model

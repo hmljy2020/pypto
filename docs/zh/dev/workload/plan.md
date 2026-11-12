@@ -1,6 +1,10 @@
 # PyPTO workload 方案
 
-设计笔记 · 2026-11-12 · CPU 解释器与多核捕获已实现，时间回放待实现
+当前方案见 [SSNPU workload 设计笔记](design.md)：直接手写扩展 Tile IR，
+显式表达 block/thread、共享存储和消费生命周期。下文保留已有 PyPTO 算子导入路线
+及解释器实现记录，作为可复用基础。
+
+设计笔记 · 2026-11-12 · CPU 解释器、多核与手写 SSNPU 捕获已实现，时间回放待实现
 
 目标是把 PyPTO 算子转换成 WSE + superscalarNPU 性能模型的工作负载（workload）。
 首个里程碑采用单线程、单 PE，以整条 tile 操作为粒度进行乱序调度和执行。

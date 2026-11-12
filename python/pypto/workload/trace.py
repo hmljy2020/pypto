@@ -46,14 +46,17 @@ class ExecutionResult:
         manifest_path = folder / "manifest.json"
         manifest_path.unlink(missing_ok=True)
         instances = []
-        grouped: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
+        grouped: dict[tuple[int, ...], list[dict[str, Any]]] = {}
         for op in self.trace:
-            key = tuple(op[k] for k in ("task_id", "block_id", "subblock_id"))
+            key = tuple(op[k] for k in ("task_id", "block_id", "subblock_id", "thread_id") if k in op)
             grouped.setdefault(key, []).append(op)
         for task in self.tasks:
             for instance in task["instances"]:
-                key = tuple(instance[k] for k in ("task_id", "block_id", "subblock_id"))
-                filename = f"task_{key[0]}_block_{key[1]}_subblock_{key[2]}.jsonl"
+                key = tuple(
+                    instance[k] for k in ("task_id", "block_id", "subblock_id", "thread_id") if k in instance
+                )
+                suffix = f"_thread_{key[3]}" if len(key) == 4 else ""
+                filename = f"task_{key[0]}_block_{key[1]}_subblock_{key[2]}{suffix}.jsonl"
                 records = grouped.get(key, [])
                 self._write_jsonl(folder / filename, records)
                 instances.append({**instance, "trace_file": filename})
@@ -64,7 +67,12 @@ class ExecutionResult:
         self._write_json(
             manifest_path,
             {
-                "format_version": 1,
+                "format_version": self.capture_config.get("format_version", 1),
+                **(
+                    {"ssnpu_spec_version": self.capture_config["ssnpu_spec_version"]}
+                    if "ssnpu_spec_version" in self.capture_config
+                    else {}
+                ),
                 "complete": self.capture_config.get("complete", False),
                 "instances": instances,
                 "tasks_file": "tasks.json",

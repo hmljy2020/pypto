@@ -14,7 +14,7 @@ from typing import Any
 
 from pypto.pypto_core import ir as _ir
 
-from .runtime import RuntimeObject, UnknownValue
+from .runtime import RuntimeObject, SharedHandle, UnknownValue
 from .trace import TraceRecorder
 
 
@@ -32,9 +32,14 @@ class Instance:
     block_num: int
     subblock_id: int = 0
     op_sequence: int = 0
+    thread_id: int | None = None
+    thread_num: int = 1
 
     def identity(self) -> dict[str, int]:
-        return {k: getattr(self, k) for k in ("task_id", "block_id", "subblock_id")}
+        return {
+            **{k: getattr(self, k) for k in ("task_id", "block_id", "subblock_id")},
+            **({"thread_id": self.thread_id} if self.thread_id is not None else {}),
+        }
 
 
 @dataclass(frozen=True)
@@ -48,6 +53,8 @@ class Launch:
 
 def json_value(value: Any) -> Any:
     """Snapshot runtime values without serializing payloads or Python identities."""
+    if isinstance(value, SharedHandle):
+        return value.describe()
     if isinstance(value, RuntimeObject):
         return {"object_id": value.object_id, "version": value.version}
     if isinstance(value, TaskId):
@@ -157,20 +164,7 @@ class CaptureRuntime:
                 task["status"] = "skipped"
                 task["skip_reason"] = "predicate" if not spec.predicate else "zero_blocks"
             else:
-                for block_id in range(spec.core_num):
-                    self.current = Instance(task_id, block_id, spec.core_num)
-                    self.ctx._tick(node)
-                    instance = {**self.current.identity(), "status": "running", "operation_count": 0}
-                    task["instances"].append(instance)
-                    try:
-                        outputs = self.ctx._invoke(fn, args)
-                    except Exception:
-                        instance["status"] = "failed"
-                        raise
-                    finally:
-                        instance["operation_count"] = self.current.op_sequence
-                    instance["status"] = "completed"
-                    self.event("instance_complete", node)
+                outputs = self._launch_instances(fn, args, spec, node, task)
                 task["status"] = "completed"
             task["outputs"] = json_value(outputs)
             task["completion_op_id"] = self.ctx.next_op_id
@@ -182,6 +176,56 @@ class CaptureRuntime:
             self.current = parent
         self.event("task_complete", node, completed_task_id=task_id, status=task["status"])
         return outputs, TaskId(task_id)
+
+    def _launch_instances(
+        self, fn: _ir.Function, args: tuple[Any, ...], spec: Launch, node: Any, task: dict[str, Any]
+    ) -> tuple[Any, ...]:
+        """Instantiate blocks and optional target threads with separate placement."""
+        task_id = task["task_id"]
+        outputs = ()
+        thread_num = fn.attrs.get("ssnpu.threads")
+        if thread_num is not None:
+            if type(thread_num) is not int or thread_num <= 0:
+                raise ValueError(f"Invalid SSNPU thread count: {thread_num}")
+            self.ctx.ssnpu.enabled = True
+            order = tuple(range(thread_num)) if self.ctx.thread_order is None else self.ctx.thread_order
+            if sorted(order) != list(range(thread_num)):
+                raise ValueError(f"thread_order must be a permutation of range({thread_num})")
+        else:
+            order = (None,)
+        for block_id in range(spec.core_num):
+            for thread_id in order:
+                self.current = Instance(
+                    task_id, block_id, spec.core_num, thread_id=thread_id, thread_num=thread_num or 1
+                )
+                self.ctx._tick(node)
+                instance = {**self.current.identity(), "status": "running", "operation_count": 0}
+                if thread_id is not None:
+                    cores = self.ctx.evaluate_attribute(
+                        fn.attrs.get("ssnpu.cores", list(range(spec.core_num)))
+                    )
+                    pes = self.ctx.evaluate_attribute(
+                        fn.attrs.get("ssnpu.pe_mapping", list(range(thread_num)))
+                    )
+                    for mapping, size in ((cores, spec.core_num), (pes, thread_num)):
+                        if (
+                            len(mapping) != size
+                            or len(set(mapping)) != size
+                            or any(type(v) is not int or v < 0 for v in mapping)
+                        ):
+                            raise ValueError(f"Invalid SSNPU placement: {mapping}")
+                    instance["mapping"] = {"core_id": cores[block_id], "pe_id": pes[thread_id]}
+                task["instances"].append(instance)
+                try:
+                    outputs = self.ctx._invoke(fn, args)
+                except Exception:
+                    instance["status"] = "failed"
+                    raise
+                finally:
+                    instance["operation_count"] = self.current.op_sequence
+                instance["status"] = "completed"
+                self.event("instance_complete", node)
+        return outputs
 
     def enter_scope(self, stmt: _ir.RuntimeScopeStmt) -> None:
         scope_id = self.next_scope_id

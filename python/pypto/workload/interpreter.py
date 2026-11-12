@@ -23,6 +23,7 @@ from .capture import CaptureRuntime, Launch, TaskId, json_value
 from .control import control_ops
 from .ops import default_ops
 from .runtime import DTYPE_NAMES, DTYPES, ObjectRuntime, OpResult, RuntimeObject, TensorSpec, UnknownValue
+from .ssnpu_runtime import FUNCTION_ATTRS, SSNPURuntime
 from .trace import ExecutionResult, TraceRecorder
 
 OpHandler = Callable[["TileInterpreter", _ir.Call, tuple[Any, ...]], OpResult]
@@ -89,13 +90,24 @@ class TileInterpreter:
         capture_config: Explicit positive device query values, keyed by
             available_cluster_count or available_aiv_count. No device defaults
             are inferred from the machine running the interpreter.
+        thread_order: Optional SSNPU thread capture permutation. It affects
+            record IDs, not producer bindings or synchronization semantics.
     """
 
     def __init__(
-        self, max_steps: int = 1_000_000, *, capture_config: Mapping[str, int] | None = None
+        self,
+        max_steps: int = 1_000_000,
+        *,
+        capture_config: Mapping[str, int] | None = None,
+        thread_order: tuple[int, ...] | None = None,
     ) -> None:
         if type(max_steps) is not int or max_steps <= 0:
             raise ValueError(f"max_steps must be a positive integer, got {max_steps}")
+        if thread_order is not None and (not thread_order or any(type(t) is not int for t in thread_order)):
+            raise ValueError(f"thread_order must be a nonempty integer permutation, got {thread_order}")
+        self.thread_order = thread_order
+        self.dynamic_path: list[str] = []
+        self.ssnpu = SSNPURuntime(self)
         self.max_steps = max_steps
         self.registry: dict[str, tuple[OpHandler, ComputeHandler | None]] = default_ops()
         self.registry.update(control_ops())
@@ -157,6 +169,8 @@ class TileInterpreter:
         self.env, self.steps, self.function = {}, 0, entry
         self.call_stack, self._active_call = [], None
         self.capture = CaptureRuntime(self, capture_trace)
+        self.ssnpu = SSNPURuntime(self)
+        self.dynamic_path = []
         fn = program.get_function(entry)
         if fn is None:
             raise InterpreterError(f"Entry function {entry!r} not found")
@@ -191,9 +205,15 @@ class TileInterpreter:
                 outputs = self._invoke(fn, tuple(values))
             else:
                 try:
-                    outputs, _ = self.capture.launch(fn, tuple(values), Launch(), fn)
+                    outputs, _ = self.capture.launch(
+                        fn, tuple(values), Launch(core_num=fn.attrs.get("ssnpu.blocks", 1)), fn
+                    )
                 except Exception as error:
                     raise InterpreterError(str(error)) from error
+        try:
+            self.ssnpu.finalize()
+        except ValueError as error:
+            raise InterpreterError(f"SSNPU capture validation: {error}") from error
         return ExecutionResult(
             tuple(_unwrap(v, self.mode, f"return in {entry} at {fn.span}") for v in outputs),
             self.recorder.records,
@@ -211,6 +231,22 @@ class TileInterpreter:
                 "synchronization_policy": "record_and_continue",
                 "storage_dependency_policy": "whole_storage_in_capture_order",
                 "subblock_policy": "unsplit_zero",
+                **(
+                    {
+                        "format_version": 2,
+                        "ssnpu_spec_version": 1,
+                        "scheduling_policy": "explicit_thread_capture_order",
+                        "thread_order": list(self.thread_order)
+                        if self.thread_order is not None
+                        else "ascending",
+                        "synchronization_policy": "validated_full_block_phases",
+                        "storage_dependency_policy": "rectangles_and_immutable_shared_versions",
+                        "shared_storage_policy": "independent_versions",
+                        "shared_lifetime_policy": "last_use_and_all_prior_reads_complete",
+                    }
+                    if self.ssnpu.enabled
+                    else {}
+                ),
             },
             [obj.describe() for obj in self.objects.objects],
         )
@@ -230,7 +266,11 @@ class TileInterpreter:
         self.env, self.function = {}, fn.name
         self.call_stack.append(fn.name)
         try:
-            unknown = set(fn.attrs) - {"mx_tensor_views_blocked", "spmd_unwrapped", "core_num", "sync_start"}
+            unknown = (
+                set(fn.attrs)
+                - {"mx_tensor_views_blocked", "spmd_unwrapped", "core_num", "sync_start"}
+                - FUNCTION_ATTRS
+            )
             if unknown:
                 raise InterpreterError(
                     f"{fn.name} at {fn.span}: unsupported function attributes {sorted(unknown)}"
@@ -284,6 +324,8 @@ class TileInterpreter:
         if typ.memref is not None:
             raise ValueError("Physical MemRef-backed Tile IR is not supported")
         space = typ.memory_space.name if typ.memory_space is not None else "Unspecified"
+        if self.ssnpu.active and space != "Unspecified":
+            raise ValueError("SSNPU tiles use storage attributes, not Ascend memory spaces")
         if space not in {"Unspecified", "Vec", "Mat", "Left", "Right", "Acc"}:
             raise ValueError(f"Unsupported tile memory space {space}")
         # Layout is part of the descriptor even when the compiler selects a
@@ -297,6 +339,8 @@ class TileInterpreter:
         layout = {k: str(getattr(view, k)) for k in ("blayout", "slayout", "fractal", "pad", "compact")}
         obj = self.objects.create(TensorSpec(shape, typ.dtype), "tile", valid, space, layout)
         obj.owner_instance = self.capture.identity()
+        if self.ssnpu.active:
+            obj.memory_space = "LocalTileReg"
         return obj
 
     def payload(self, obj: RuntimeObject) -> torch.Tensor:
@@ -434,7 +478,7 @@ class TileInterpreter:
             elif "core_num" in attrs:
                 core_num = attrs["core_num"]
             else:
-                core_num = self.evaluate_attribute(fn.attrs.get("core_num", 1))
+                core_num = self.evaluate_attribute(fn.attrs.get("core_num", fn.attrs.get("ssnpu.blocks", 1)))
             predicate = (
                 self.evaluate(expr.predicate)
                 if is_submit and expr.predicate is not None
@@ -462,15 +506,40 @@ class TileInterpreter:
             values = self._invoke(fn, args)
         return values[0] if len(values) == 1 else values
 
+    def _call_arguments(self, expr: _ir.Call | _ir.Submit) -> tuple[Any, ...]:
+        """Keep nested expression call paths distinct for dynamic target sites."""
+        arguments = []
+        for index, value in enumerate(expr.args):
+            self.dynamic_path.append(f"arg:{index}")
+            try:
+                arguments.append(self.evaluate(value))
+            finally:
+                self.dynamic_path.pop()
+        return tuple(arguments)
+
     def _call(self, expr: _ir.Call | _ir.Submit) -> Any:
         previous_call = self._active_call
         try:
-            args = tuple(self.evaluate(v) for v in expr.args)
+            args = self._call_arguments(expr)
             if isinstance(expr.op, _ir.GlobalVar):
-                return self._function_call(expr, args)
+                if self.ssnpu.active:
+                    self.ssnpu.prepare(args, {})
+                self.dynamic_path.append(f"call:{expr.op.name}")
+                try:
+                    return self._function_call(expr, args)
+                finally:
+                    self.dynamic_path.pop()
             if isinstance(expr, _ir.Submit):
                 raise ValueError("Submit requires a GlobalVar callee")
+            original = expr
+            meta = self.ssnpu.metadata(expr)
+            target_handler = self.ssnpu.handlers.get(expr.op.name)
+            if meta:
+                self.ssnpu.prepare(args, meta)
+                expr = self.ssnpu.clean_call(expr)
             handlers = self.registry.get(expr.op.name)
+            if target_handler is not None:
+                handlers = (None, None)
             if handlers is None:
                 raise ValueError("No registered semantics implementation")
             semantics, compute = handlers
@@ -485,24 +554,36 @@ class TileInterpreter:
                 "args": json_value(args),
                 "kwargs": json_value(kwargs),
             }
-            result = semantics(self, expr, args)
+            result = (
+                target_handler(original, args, meta)
+                if target_handler is not None
+                else semantics(self, expr, args)
+            )
             if not isinstance(result, OpResult):
                 raise TypeError("Operation semantics must return OpResult")
+            if meta:
+                self.ssnpu.effects(original, args, result, meta)
             self.concrete(result.parameters, expr, f"{expr.op.name} trace parameters")
             if self.mode == "functional":
-                if compute is None:
-                    raise ValueError("Missing numerical implementation (compute) for functional mode")
-                for obj in result.reads:
-                    self.payload(obj)
-                compute(self, expr, args, result)
-                if not expr.op.name.startswith("array."):
-                    self.concrete(result.value, expr, f"{expr.op.name} functional result")
-            self._finish(expr, result, before, parameters)
+                self._compute(expr, args, result, compute)
+            self._finish(original, result, before, parameters)
             return result.value
         except Exception as error:
             raise InterpreterError(f"{expr.op.name} in {self.function} at {expr.span}: {error}") from error
         finally:
             self._active_call = previous_call
+
+    def _compute(
+        self, expr: _ir.Call, args: tuple[Any, ...], result: OpResult, compute: ComputeHandler | None
+    ) -> None:
+        """Run optional numerical semantics; missing payloads never fabricate values."""
+        if compute is None:
+            raise ValueError("Missing numerical implementation (compute) for functional mode")
+        for obj in result.reads:
+            self.payload(obj)
+        compute(self, expr, args, result)
+        if not expr.op.name.startswith("array."):
+            self.concrete(result.value, expr, f"{expr.op.name} functional result")
 
     def _finish(
         self,
@@ -529,7 +610,9 @@ class TileInterpreter:
         dependencies = {
             before[obj.object_id]["producer"]
             for obj in (*result.reads, *result.writes)
-            if obj.object_id in before and before[obj.object_id]["producer"] is not None
+            if obj.object_id in before
+            and before[obj.object_id]["producer"] is not None
+            and not (self.ssnpu.active and (obj.kind == "tensor" or obj.shared_version is not None))
         }
         # Descriptor creation and storage writes are distinct effects. Aliases
         # share storage state; a multi-view write advances that storage once.
@@ -542,27 +625,33 @@ class TileInterpreter:
         updated = set()
         for obj in writes:
             if obj.storage.storage_id not in updated:
-                obj.version += 1
+                if obj.shared_version is None:
+                    obj.version += 1
                 obj.producer = op_id
                 updated.add(obj.storage.storage_id)
         for obj in result.views:
             obj.view_producer = op_id
         self.next_op_id += 1
-        self.recorder.record(
-            {
-                "op_id": op_id,
-                **self.capture.identity(),
-                "instance_op_sequence": self.capture.current.op_sequence if self.capture.current else None,
-                "ir_op": call.op.name,
-                "pto_op": result.pto_op,
-                "function": self.function,
-                "location": str(call.span),
-                "parameters": {**parameters, **json_value(result.parameters)},
-                "inputs": reads,
-                "outputs": [obj.describe() for obj in (*writes, *result.views)],
-                "dependencies": sorted(dependencies),
-            }
-        )
+        record = {
+            "op_id": op_id,
+            **self.capture.identity(),
+            "instance_op_sequence": self.capture.current.op_sequence if self.capture.current else None,
+            "ir_op": call.op.name,
+            "pto_op": result.pto_op,
+            "function": self.function,
+            "location": str(call.span),
+            "parameters": {**parameters, **json_value(result.parameters)},
+            "inputs": reads,
+            "outputs": [obj.describe() for obj in (*writes, *result.views)],
+            "dependencies": sorted(dependencies),
+        }
+        self.ssnpu.record(record, result)
+        if self.ssnpu.active:
+            # Preserve the same dictionary until post-capture producer linking.
+            if self.recorder.enabled:
+                self.recorder.records.append(record)
+        else:
+            self.recorder.record(record)
         if self.capture.current is not None:
             self.capture.current.op_sequence += 1
 
@@ -589,8 +678,12 @@ class TileInterpreter:
     def _execute_stmt(self, stmt: _ir.Stmt) -> None:
         self._tick(stmt)
         if isinstance(stmt, _ir.SeqStmts):
-            for child in stmt.stmts:
-                self._execute(child)
+            for index, child in enumerate(stmt.stmts):
+                self.dynamic_path.append(f"stmt:{index}")
+                try:
+                    self._execute(child)
+                finally:
+                    self.dynamic_path.pop()
         elif isinstance(stmt, _ir.AssignStmt):
             self.env[stmt.var.unique_id] = self.evaluate(stmt.value)
         elif isinstance(stmt, _ir.EvalStmt):
@@ -603,7 +696,11 @@ class TileInterpreter:
         elif isinstance(stmt, _ir.IfStmt):
             condition = self.concrete(self.evaluate(stmt.condition), stmt, "if condition")
             body = stmt.then_body if condition else stmt.else_body
-            self._bind(stmt.return_vars, self._body_values(body) if body is not None else ())
+            self.dynamic_path.append(f"branch:{bool(condition)}")
+            try:
+                self._bind(stmt.return_vars, self._body_values(body) if body is not None else ())
+            finally:
+                self.dynamic_path.pop()
         elif isinstance(stmt, (_ir.ForStmt, _ir.WhileStmt)):
             self._execute_loop(stmt)
         elif isinstance(stmt, _ir.RuntimeScopeStmt):
@@ -633,6 +730,7 @@ class TileInterpreter:
                     )
                 )
             )
+        iteration = 0
         while True:
             self._tick(stmt)
             if isinstance(stmt, _ir.ForStmt):
@@ -643,6 +741,11 @@ class TileInterpreter:
                 self.env[stmt.loop_var.unique_id] = index
             elif not self.concrete(self.evaluate(stmt.condition), stmt, "while condition"):
                 break
-            values = self._body_values(stmt.body)
+            self.dynamic_path.append(f"iteration:{iteration}")
+            try:
+                values = self._body_values(stmt.body)
+            finally:
+                self.dynamic_path.pop()
+            iteration += 1
             self._bind(stmt.iter_args, values)
         self._bind(stmt.return_vars, values)

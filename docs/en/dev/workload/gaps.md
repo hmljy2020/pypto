@@ -1,5 +1,10 @@
 # PyPTO integration questions
 
+See [SSNPU workload design notes](design.md) for the current handwritten IR
+implementation, executable examples and capture format. The questions below retain operator adaptation,
+timing and Calendar integration topics; automatic lowering belongs to the
+later operator import path.
+
 Design notes · 2026-11-11
 
 The [workload plan](plan.md) is organized around target adaptation, CPU

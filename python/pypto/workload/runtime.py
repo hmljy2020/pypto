@@ -79,6 +79,25 @@ class UnknownValue:
         raise ValueError(f"Unknown payload value from {', '.join(self.sources)} requires a concrete value")
 
 
+@dataclass(frozen=True)
+class SharedHandle:
+    """Block-owned declaration identity; unlike a version, it has no payload."""
+
+    handle_id: str
+    shape: tuple[int, ...]
+    dtype: DataType
+    owner: tuple[int, int]
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "handle_id": self.handle_id,
+            "shape": list(self.shape),
+            "dtype": DTYPE_NAMES[self.dtype],
+            "memory_space": "SharedTileReg",
+            "owner_instance": {"task_id": self.owner[0], "block_id": self.owner[1]},
+        }
+
+
 @dataclass
 class StorageState:
     """One logical allocation generation, shared by all descriptor views."""
@@ -108,6 +127,9 @@ class RuntimeObject:
     view_producer: int | None = None
     owner_instance: dict[str, int] | None = None
 
+    shared_handle: str | None = None
+    shared_version: str | None = None
+
     def __post_init__(self) -> None:
         self.storage = StorageState(self.object_id)
 
@@ -130,6 +152,11 @@ class RuntimeObject:
     def describe(self) -> dict[str, Any]:
         """Return a detached metadata snapshot (never tensor contents)."""
         return {
+            **(
+                {"shared_handle": self.shared_handle, "shared_version": self.shared_version}
+                if self.shared_version is not None
+                else {}
+            ),
             "object_id": self.object_id,
             "version": self.version,
             "kind": self.kind,

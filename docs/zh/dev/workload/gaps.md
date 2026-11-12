@@ -1,5 +1,9 @@
 # PyPTO 适配问题笔记
 
+已实现的手写 IR、可执行示例及捕获格式见 [SSNPU workload 设计笔记](design.md)。
+下文保留算子自动适配、计时模型和 Calendar 集成问题；其中自动 lowering
+相关问题属于后续导入路线。
+
 设计笔记 · 2026-11-11
 
 [Workload 方案](plan.md)围绕目标适配、CPU 解释执行和计时回放展开。
