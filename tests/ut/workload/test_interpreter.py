@@ -16,6 +16,7 @@ import pytest
 import torch
 from pypto import DataType, backend, ir
 from pypto.ir import OptimizationStrategy, PassManager
+from pypto.ir.op import system_ops
 from pypto.workload import InterpreterError, OpResult, TensorSpec, TileInterpreter, UnknownValue
 
 S = ir.Span("interpreter_test.py", 1, 1)
@@ -1065,6 +1066,486 @@ def test_transpose_view_alias_and_concat_allocation():
     assert result.trace[1]["pto_op"] is None
     assert result.trace[-1]["pto_op"] == "pto.tconcat"
     assert copied["shape"] == [4, 8]
+
+
+@pl.program
+class MulticoreMatmul:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        a: pl.Tensor[[512, 128], pl.FP16],
+        b: pl.Tensor[[128, 128], pl.FP16],
+        c: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+    ) -> pl.Tensor[[512, 128], pl.FP32]:
+        row = pl.tile.get_block_idx() * 128
+        at = pl.load(a, [row, 0], [128, 128])
+        bt = pl.load(b, [0, 0], [128, 128])
+        ct = pl.matmul(at, bt)
+        c = pl.store(ct, [row, 0], c)
+        return c
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        a: pl.Tensor[[512, 128], pl.FP16],
+        b: pl.Tensor[[128, 128], pl.FP16],
+        c: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+    ) -> pl.Tensor[[512, 128], pl.FP32]:
+        with pl.manual_scope():
+            c, tid = pl.spmd_submit(self.kernel, a, b, c, core_num=4)
+        return c
+
+
+def test_multicore_checkpoints_and_export(tmp_path):
+    backend.reset_for_testing()
+    backend.set_backend_type(backend.BackendType.Ascend910)
+    prog = MulticoreMatmul
+    a = torch.arange(512 * 128).reshape(512, 128).remainder(5).half()
+    b = torch.ones((128, 128), dtype=torch.float16)
+    inputs = {"a": a, "b": b, "c": torch.zeros((512, 128))}
+    try:
+        for compiler_pass in PassManager.get_strategy(OptimizationStrategy.Default).passes:
+            prog = compiler_pass(prog)
+            stage = compiler_pass.get_name()
+            if stage not in {"ConvertTensorToTileOps", "InferTileMemorySpace"}:
+                continue
+            count = 16 if stage == "ConvertTensorToTileOps" else 24
+            interpreter = TileInterpreter()
+            captured = interpreter.run(prog, "main", inputs)
+            assert torch.count_nonzero(inputs["c"]) == 0
+            actual = interpreter.run(
+                prog, "main", {k: v.clone() for k, v in inputs.items()}, mode="functional"
+            )
+            torch.testing.assert_close(actual.outputs[0], a.float() @ b.float(), rtol=0, atol=0)
+            assert captured.trace == actual.trace
+            assert captured.tasks == actual.tasks
+            assert captured.events == actual.events
+            assert len(captured.trace) == count
+            assert len(captured.tasks) == 1
+            assert len(captured.tasks[0]["instances"]) == 4
+            stores = [op for op in captured.trace if op["ir_op"] == "tile.store"]
+            assert [op["parameters"]["offsets"] for op in stores] == [[i * 128, 0] for i in range(4)]
+            assert len({op["outputs"][0]["storage_id"] for op in stores}) == 1
+            tiles = [op["outputs"][0] for op in captured.trace if op["ir_op"] == "tile.load"]
+            assert len({tile["storage_id"] for tile in tiles}) == 8
+            assert {tile["owner_instance"]["block_id"] for tile in tiles} == set(range(4))
+            folder = tmp_path / stage
+            captured.write_capture(folder)
+            saved = {p.name: p.read_bytes() for p in folder.iterdir()}
+            repeated = interpreter.run(prog, "main", inputs)
+            repeated.write_capture(folder)
+            assert saved == {p.name: p.read_bytes() for p in folder.iterdir()}
+            manifest = json.loads((folder / "manifest.json").read_text())
+            assert manifest["complete"] and len(manifest["instances"]) == 4
+            for instance in manifest["instances"]:
+                records = [json.loads(s) for s in (folder / instance["trace_file"]).read_text().splitlines()]
+                assert len(records) == count // 4
+                assert [op["instance_op_sequence"] for op in records] == list(range(count // 4))
+            if stage == "InferTileMemorySpace":
+                break
+    finally:
+        backend.reset_for_testing()
+
+
+@pl.program
+class MpmdTasks:
+    @pl.function(type=pl.FunctionType.InCore)
+    def matrix(
+        self,
+        a: pl.Tensor[[128, 128], pl.FP16],
+        b: pl.Tensor[[128, 128], pl.FP16],
+        c: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+    ) -> pl.Tensor[[128, 128], pl.FP32]:
+        at = pl.load(a, [0, 0], [128, 128])
+        bt = pl.load(b, [0, 0], [128, 128])
+        ct = pl.matmul(at, bt)
+        c = pl.store(ct, [0, 0], c)
+        return c
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def copy(
+        self, x: pl.Tensor[[128, 128], pl.FP32], y: pl.Out[pl.Tensor[[128, 128], pl.FP32]]
+    ) -> pl.Tensor[[128, 128], pl.FP32]:
+        t = pl.load(x, [0, 0], [128, 128])
+        y = pl.store(t, [0, 0], y)
+        return y
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(
+        self,
+        a: pl.Tensor[[128, 128], pl.FP16],
+        b: pl.Tensor[[128, 128], pl.FP16],
+        x: pl.Tensor[[128, 128], pl.FP32],
+        c: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+        y: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+        z: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+    ) -> pl.Tensor[[128, 128], pl.FP32]:
+        with pl.manual_scope():
+            c, matrix_id = pl.submit(self.matrix, a, b, c)
+            y, copy_id = pl.submit(self.copy, x, y)
+            z, consumer_id = pl.submit(self.copy, c, z, deps=[matrix_id])
+        return z
+
+
+def test_mpmd_dependencies_and_numerical_checkpoints():
+    backend.reset_for_testing()
+    backend.set_backend_type(backend.BackendType.Ascend910)
+    prog = MpmdTasks
+    inputs = {
+        name: torch.ones((128, 128), dtype=torch.float16 if name in {"a", "b"} else torch.float32)
+        for name in ("a", "b", "x", "c", "y", "z")
+    }
+    try:
+        for compiler_pass in PassManager.get_strategy(OptimizationStrategy.Default).passes:
+            prog = compiler_pass(prog)
+            stage = compiler_pass.get_name()
+            if stage not in {"ConvertTensorToTileOps", "InferTileMemorySpace"}:
+                continue
+            result = TileInterpreter().run(prog, "main", inputs)
+            assert len(result.trace) == (8 if stage == "ConvertTensorToTileOps" else 10)
+            assert [task["entry"] for task in result.tasks] == ["matrix", "copy", "copy"]
+            assert [task["dependencies"] for task in result.tasks] == [[], [], [0]]
+            assert all(task["status"] == "completed" for task in result.tasks)
+            actual = TileInterpreter().run(
+                prog, "main", {k: v.clone() for k, v in inputs.items()}, mode="functional"
+            )
+            torch.testing.assert_close(actual.outputs[0], inputs["a"].float() @ inputs["b"].float())
+            assert actual.trace == result.trace and actual.tasks == result.tasks
+            assert actual.events == result.events
+            if stage == "InferTileMemorySpace":
+                break
+    finally:
+        backend.reset_for_testing()
+
+
+def _identity_kernel(name="kernel", kind=ir.FunctionType.InCore):
+    return ir.Function(name, [], [INDEX], ret(ir.op.tile.get_block_idx()), S, type=kind)
+
+
+def _dispatch(fn, *, blocks=None, predicate=None, deps=()):
+    types = [*fn.return_types, ir.ScalarType(DataType.TASK_ID)]
+    typ = ir.TupleType(types) if fn.return_types else types[0]
+    return ir.Submit(ir.GlobalVar(fn.name), [], deps, {}, {}, typ, S, core_num=blocks, predicate=predicate)
+
+
+def _orch_program(functions, body, params=(), returns=()):
+    main = ir.Function("main", list(params), returns, body, S, type=ir.FunctionType.Orchestration)
+    return ir.Program([*functions, main], "capture_test", S)
+
+
+@pytest.mark.parametrize("wrapper_type", [ir.FunctionType.Spmd, ir.FunctionType.Group])
+def test_launch_call_wrappers_and_helper_identity(wrapper_type):
+    helper = _identity_kernel("helper", ir.FunctionType.Opaque)
+    kernel = ir.Function(
+        "kernel",
+        [],
+        [INDEX],
+        ret(ir.Call(ir.GlobalVar("helper"), [], INDEX, S)),
+        S,
+        type=ir.FunctionType.InCore,
+    )
+    wrapper = ir.Function(
+        "wrapper",
+        [],
+        [INDEX],
+        ret(ir.Call(ir.GlobalVar("kernel"), [], INDEX, S)),
+        S,
+        type=wrapper_type,
+        attrs={"spmd_unwrapped": True} if wrapper_type == ir.FunctionType.Group else {},
+    )
+    call = ir.Call(ir.GlobalVar("wrapper"), [], {}, {"core_num": const(3), "sync_start": True}, INDEX, S)
+    result = TileInterpreter().run(
+        _orch_program([helper, kernel, wrapper], ret(call), returns=[INDEX]), "main", {}
+    )
+    assert len(result.tasks) == 1
+    assert result.tasks[0]["sync_start"]
+    queries = [e for e in result.events if e.get("ir_op") == "tile.get_block_idx"]
+    assert [e["result"] for e in queries] == [0, 1, 2]
+    assert all(
+        e["task_id"] == 0 and e["call_stack"] == ["main", "wrapper", "kernel", "helper"] for e in queries
+    )
+
+
+def test_nested_orchestration_and_graph_parent():
+    kernel = _identity_kernel()
+    graph = ir.Function(
+        "graph",
+        [],
+        [INDEX],
+        ret(ir.Call(ir.GlobalVar("kernel"), [], INDEX, S)),
+        S,
+        type=ir.FunctionType.Graph,
+    )
+    nested = ir.Function(
+        "nested",
+        [],
+        [INDEX],
+        ret(ir.Call(ir.GlobalVar("graph"), [], INDEX, S)),
+        S,
+        type=ir.FunctionType.Orchestration,
+    )
+    result = TileInterpreter().run(
+        _orch_program(
+            [kernel, graph, nested], ret(ir.Call(ir.GlobalVar("nested"), [], INDEX, S)), returns=[INDEX]
+        ),
+        "main",
+        {},
+    )
+    assert [t["entry"] for t in result.tasks] == ["graph", "kernel"]
+    assert [t["parent_task_id"] for t in result.tasks] == [None, 0]
+
+
+def test_dynamic_blocks_loops_and_task_array_dependencies():
+    kernel = ir.Function("kernel", [], [], seq(), S, type=ir.FunctionType.InCore)
+    count = ir.Var("count", INDEX, S)
+    dispatch = _dispatch(kernel, blocks=count)
+    tid = ir.Var("tid", dispatch.type, S)
+    make_array = ir.op.array.create(2, DataType.TASK_ID)
+    array = ir.Var("array", make_array.type, S)
+    carry = ir.IterArg("carry", array.type, array, S)
+    index = ir.Var("i", INDEX, S)
+    updated = ir.Var("updated", array.type, S)
+    loop = ir.ForStmt(
+        index,
+        const(0),
+        const(2),
+        const(1),
+        [carry],
+        seq(
+            ir.AssignStmt(tid, dispatch, S), ir.YieldStmt([ir.op.array.update_element(carry, index, tid)], S)
+        ),
+        [updated],
+        S,
+    )
+    consumer = _dispatch(
+        kernel, deps=[updated, ir.op.array.get_element(updated, 0), ir.op.system.task_invalid()]
+    )
+    prog = _orch_program(
+        [kernel], seq(ir.AssignStmt(array, make_array, S), loop, ir.EvalStmt(consumer, S)), [count]
+    )
+    result = TileInterpreter().run(prog, "main", {"count": 2})
+    actual = TileInterpreter().run(prog, "main", {"count": 2}, mode="functional")
+    assert result.tasks == actual.tasks and result.events == actual.events
+    assert [t["core_num"] for t in result.tasks] == [2, 2, 1]
+    assert result.tasks[2]["dependencies"] == [0, 1]
+    assert result.trace == []
+
+
+@pytest.mark.parametrize("blocks,predicate", [(0, True), (4, False)])
+def test_skipped_task_preserves_output_and_dependency(blocks, predicate):
+    typ = ir.TensorType([2, 2], DataType.FP32)
+    dst = ir.Var("dst", typ, S)
+    kernel = ir.Function(
+        "kernel", [(dst, ir.ParamDirection.Out)], [typ], ret(dst), S, type=ir.FunctionType.InCore
+    )
+    submitted_type = ir.TupleType([typ, ir.ScalarType(DataType.TASK_ID)])
+    launch = ir.Submit(
+        ir.GlobalVar("kernel"),
+        [dst],
+        [],
+        {},
+        {},
+        submitted_type,
+        S,
+        core_num=const(blocks),
+        predicate=ir.ConstBool(predicate, S),
+    )
+    submitted = ir.Var("submitted", submitted_type, S)
+    second = ir.Submit(
+        ir.GlobalVar("kernel"), [dst], [ir.TupleGetItemExpr(submitted, 1, S)], submitted_type, S
+    )
+    prog = _orch_program(
+        [kernel],
+        seq(
+            ir.AssignStmt(submitted, launch, S),
+            ir.EvalStmt(second, S),
+            ret(ir.TupleGetItemExpr(submitted, 0, S)),
+        ),
+        [dst],
+        [typ],
+    )
+    result = TileInterpreter().run(prog, "main", {"dst": TensorSpec((2, 2), DataType.FP32)})
+    assert result.tasks[0]["status"] == "skipped" and result.tasks[0]["instances"] == []
+    assert result.tasks[1]["dependencies"] == [0]
+    assert result.outputs[0]["object_id"] == 0 and result.outputs[0]["version"] == 0
+
+
+@pytest.mark.parametrize("blocks", [-1, 1.5])
+def test_bad_launch_count(blocks):
+    kernel = _identity_kernel()
+    call = ir.Call(ir.GlobalVar("kernel"), [], {}, {"core_num": blocks}, INDEX, S)
+    with pytest.raises(InterpreterError, match="core_num must be a nonnegative integer"):
+        TileInterpreter().run(_orch_program([kernel], ir.EvalStmt(call, S)), "main", {})
+
+
+def test_skipped_ambiguous_return_and_unknown_launch():
+    kernel = _identity_kernel()
+    with pytest.raises(InterpreterError, match="Cannot determine skipped return bindings"):
+        TileInterpreter().run(
+            _orch_program([kernel], ir.EvalStmt(_dispatch(kernel, blocks=const(0)), S)), "main", {}
+        )
+    typ = ir.TensorType([2, 2], DataType.FP32)
+    src = ir.Var("src", typ, S)
+    launch = _dispatch(kernel, blocks=ir.Cast(ir.op.tensor.read(src, [0, 0]), DataType.INDEX, S))
+    with pytest.raises(InterpreterError, match="unknown payload value.*tensor.read"):
+        TileInterpreter().run(
+            _orch_program([kernel], ir.EvalStmt(launch, S), [src]),
+            "main",
+            {"src": TensorSpec((2, 2), DataType.FP32)},
+        )
+
+
+def test_device_configuration_and_sync_events(tmp_path):
+    body = seq(
+        ir.EvalStmt(system_ops.barrier(pipe=ir.PipeType.ALL), S),
+        ir.EvalStmt(system_ops.fence(), S),
+        ir.EvalStmt(system_ops.set_flag(ir.PipeType.MTE2, ir.PipeType.V, 0), S),
+        ir.EvalStmt(system_ops.wait_flag(ir.PipeType.MTE2, ir.PipeType.V, 0), S),
+        ir.EvalStmt(system_ops.syncall(), S),
+        ir.EvalStmt(system_ops.sync_set(2, pipe=ir.PipeType.MTE3), S),
+        ir.EvalStmt(system_ops.sync_wait(2, pipe=ir.PipeType.MTE2), S),
+        ret(ir.op.tile.get_block_num()),
+    )
+    kernel = ir.Function("kernel", [], [INDEX], body, S, type=ir.FunctionType.InCore)
+    dispatch = _dispatch(kernel, blocks=system_ops.available_aiv_count())
+    scope = ir.RuntimeScopeStmt(
+        True, body=ir.RuntimeScopeStmt(False, body=ir.EvalStmt(dispatch, S), span=S), span=S
+    )
+    prog = _orch_program([kernel], scope)
+    with pytest.raises(InterpreterError, match="capture_config.*available_aiv_count"):
+        TileInterpreter().run(prog, "main", {})
+    interpreter = TileInterpreter(capture_config={"available_aiv_count": 2})
+    result = interpreter.run(prog, "main", {})
+    sync = [e for e in result.events if e["kind"] == "synchronization"]
+    assert len(sync) == 14 and result.trace == []
+    barrier = next(e for e in sync if e["ir_op"] == "system.syncall")
+    assert len(barrier["parameters"]["participants"]) == 2
+    scopes = [e for e in result.events if e["kind"] == "scope_enter"]
+    assert [e["mode"] for e in scopes] == ["MANUAL", "AUTO"]
+    assert scopes[1]["parent_scope_id"] == scopes[0]["entered_scope_id"]
+    result.write_capture(tmp_path)
+    assert len(list(tmp_path.glob("task_*.jsonl"))) == 2
+    assert all(p.read_text() == "" for p in tmp_path.glob("task_*.jsonl"))
+
+
+def test_orchestration_tensor_views_shared_across_tasks():
+    typ = ir.TensorType([2, 2], DataType.FP32)
+    src, dst = ir.Var("src", typ, S), ir.Var("dst", typ, S)
+    loaded = ir.op.tile.load(src, [0, 0], [2, 2])
+    tile = ir.Var("tile", loaded.type, S)
+    kernel = ir.Function(
+        "copy",
+        [src, (dst, ir.ParamDirection.Out)],
+        [typ],
+        seq(ir.AssignStmt(tile, loaded, S), ret(ir.op.tile.store(tile, [0, 0], dst))),
+        S,
+        type=ir.FunctionType.InCore,
+    )
+    created = ir.op.tensor.create([4, 2], DataType.FP32)
+    tensor = ir.Var("tensor", created.type, S)
+    sliced = ir.op.tensor.slice(tensor, [2, 2], [2, 0])
+    view = ir.Var("view", sliced.type, S)
+    first = ir.Call(ir.GlobalVar("copy"), [src, view], typ, S)
+    second = ir.Call(ir.GlobalVar("copy"), [view, dst], typ, S)
+    body = seq(
+        ir.AssignStmt(tensor, created, S),
+        ir.AssignStmt(view, sliced, S),
+        ir.EvalStmt(first, S),
+        ir.EvalStmt(second, S),
+        ret(dst, ir.op.tensor.dim(view, 0)),
+    )
+    prog = _orch_program([kernel], body, [src, dst], [typ, ir.ScalarType(DataType.INT64)])
+    inputs = {"src": torch.ones((2, 2)), "dst": torch.zeros((2, 2))}
+    result = TileInterpreter().run(prog, "main", inputs, mode="functional")
+    torch.testing.assert_close(result.outputs[0], inputs["src"])
+    assert result.outputs[1] == 2
+    assert result.trace[2]["inputs"][0]["storage_id"] == result.trace[1]["outputs"][0]["storage_id"]
+    assert result.trace[1]["op_id"] in result.trace[2]["dependencies"]
+
+
+def test_invalid_task_id_and_global_launch_budget():
+    kernel = ir.Function("kernel", [], [], seq(), S, type=ir.FunctionType.InCore)
+    tid = ir.Var("tid", ir.ScalarType(DataType.TASK_ID), S)
+    prog = _orch_program([kernel], ir.EvalStmt(_dispatch(kernel, deps=[tid]), S), [tid])
+    with pytest.raises(InterpreterError, match="Expected TaskId dependency"):
+        TileInterpreter().run(prog, "main", {"tid": 999})
+    interpreter = TileInterpreter(max_steps=20)
+    prog = _orch_program([kernel], ir.EvalStmt(_dispatch(kernel, blocks=const(100)), S))
+    with pytest.raises(InterpreterError, match="task/block.*step limit"):
+        interpreter.run(prog, "main", {})
+    assert interpreter.capture.tasks[0]["status"] == "failed"
+    assert len(interpreter.capture.tasks[0]["instances"]) < 100
+
+
+def test_capture_disabled_keeps_task_topology():
+    kernel = _identity_kernel()
+    prog = _orch_program([kernel], ir.EvalStmt(_dispatch(kernel, blocks=const(3)), S))
+    interpreter = TileInterpreter()
+    recorded = interpreter.run(prog, "main", {})
+    muted = interpreter.run(prog, "main", {}, capture_trace=False)
+    assert recorded.tasks == muted.tasks
+    assert muted.trace == muted.events == []
+
+
+@pytest.mark.parametrize("flag", [0.0, 1.0])
+def test_payload_predicate_requires_concrete_source(flag):
+    typ = ir.TensorType([2, 2], DataType.FP32)
+    dst = ir.Var("dst", typ, S)
+    flags = ir.Var("flags", typ, S)
+    kernel = ir.Function(
+        "kernel", [(dst, ir.ParamDirection.Out)], [typ], ret(dst), S, type=ir.FunctionType.InCore
+    )
+    predicate = ir.Gt(
+        ir.op.tensor.read(flags, [0, 0]), ir.ConstFloat(0.0, DataType.FP32, S), DataType.BOOL, S
+    )
+    launch = ir.Submit(
+        ir.GlobalVar("kernel"),
+        [dst],
+        [],
+        {},
+        {},
+        ir.TupleType([typ, ir.ScalarType(DataType.TASK_ID)]),
+        S,
+        core_num=const(2),
+        predicate=predicate,
+    )
+    prog = _orch_program([kernel], ir.EvalStmt(launch, S), [dst, flags])
+    inputs = {"dst": torch.ones((2, 2)), "flags": torch.full((2, 2), flag)}
+    interpreter = TileInterpreter()
+    with pytest.raises(InterpreterError, match="task launch.*unknown payload value.*tensor.read"):
+        interpreter.run(prog, "main", inputs)
+    assert any(e.get("ir_op") == "tensor.read" for e in interpreter.capture.events.records)
+    assert interpreter.capture.tasks == []
+    actual = interpreter.run(prog, "main", inputs, mode="functional")
+    assert actual.tasks[0]["status"] == ("completed" if flag else "skipped")
+    assert len(actual.tasks[0]["instances"]) == (2 if flag else 0)
+
+
+def test_explicit_roles_and_direct_kernel_context():
+    kernel = ir.Function(
+        "kernel",
+        [],
+        [INDEX],
+        ret(ir.op.tile.get_subblock_idx()),
+        S,
+        level=ir.Level.CHIP_DIE,
+        role=ir.Role.SubWorker,
+    )
+    main = ir.Function(
+        "main",
+        [],
+        [INDEX],
+        ret(ir.Call(ir.GlobalVar("kernel"), [], INDEX, S)),
+        S,
+        level=ir.Level.CHIP,
+        role=ir.Role.Orchestrator,
+    )
+    prog = ir.Program([kernel, main], "roles", S)
+    result = TileInterpreter().run(prog, "main", {})
+    assert [task["entry"] for task in result.tasks] == ["kernel"]
+    direct = TileInterpreter().run(prog, "kernel", {})
+    assert direct.outputs == result.outputs == (0,)
+    assert direct.tasks[0]["core_num"] == 1
 
 
 if __name__ == "__main__":

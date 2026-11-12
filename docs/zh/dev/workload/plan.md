@@ -1,6 +1,6 @@
 # PyPTO workload 方案
 
-设计笔记 · 2026-11-11 · CPU 解释器已实现，时间回放待实现
+设计笔记 · 2026-11-12 · CPU 解释器与多核捕获已实现，时间回放待实现
 
 目标是把 PyPTO 算子转换成 WSE + superscalarNPU 性能模型的工作负载（workload）。
 首个里程碑采用单线程、单 PE，以整条 tile 操作为粒度进行乱序调度和执行。
@@ -187,9 +187,9 @@ move 接受与结果类型一致的显式 `blayout/slayout`，包括 Cube→Vect
 
 每条事件包含从零开始的 ID、IR/PTO 名称、函数/源码位置、具体 args/kwargs、输入输出快照
 和直接生产者依赖；load/store 还包含 Tensor ID 与偏移。初始输入版本为零、无生产者；
-每次操作写入（包括新 tile 的首次写入）递增版本。这是单线程依赖，尚非完整的调度/别名模型。
+每次操作写入（包括新 tile 的首次写入）递增版本。依赖遵循跨实例的捕获顺序，尚非完整的调度/别名模型。
 执行引擎负责 ID、版本和生产者，记录器仅保存快照。在相同控制流路径上，相同受支持 IR 与
-输入描述在两种模式中产生相同 trace。当前导出 JSONL；manifest/objects 独立文件和计时回放待实现。
+输入描述在两种模式中产生相同 trace。操作导出为 JSONL；`write_capture` 同时导出 manifest/objects 独立文件，计时回放待实现。
 
 扩展注册两个独立入口：
 
@@ -229,3 +229,74 @@ PYTHONPATH=pypto/python .venv-ir/bin/python workspace/matmul-tile-ir/run_interpr
 向 `workspace/matmul-tile-ir/interpreter-output/` 导出 JSONL。
 `tests/ut/workload/test_interpreter.py` 还覆盖随机输入精度、纯 trace 模式不分配 tile 载荷、
 Tensor 输入不变、未知值诊断、短路、尾块/非连续访问、快照及注册表隔离。
+
+## 完整入口多核捕获
+
+解释器可从完整编排入口执行 `ConvertTensorToTileOps` 和 `InferTileMemorySpace`
+两个阶段的程序。捕获按遇到启动的顺序将任务执行到底，每个任务按 block ID 递增执行。
+嵌套启动立即执行，保留父任务和父实例引用。这是确定性工作负载捕获，不模拟设备并发、
+死锁、flag 匹配或 barrier 的内存可见性。
+
+```python
+interpreter = TileInterpreter(capture_config={"available_aiv_count": 48})
+result = interpreter.run(program, entry="main", inputs=inputs)
+result.write_capture("workspace/multicore-ir-review/capture-output/example")
+result.write_trace("workspace/multicore-ir-review/merged.jsonl")
+```
+
+普通 `Submit` 创建单 block；`Submit.core_num` 和 `Call` 启动属性按指定数量展开。
+数量可来自调用者环境中的动态表达式。Orchestration/Graph 调用 InCore、AIC、AIV、
+Spmd、Group 或 Graph 函数时创建任务。Spmd/Group 包装层继承已启动实例，内部普通
+kernel 调用不会二次展开；Graph 是编排容器，可启动子任务。普通辅助调用继承身份，
+但创建独立变量环境。直接执行 kernel 入口时使用单任务单 block。兼容旧函数级启动属性，
+调用点属性优先。
+
+每条操作保留全局 `op_id`，新增 `task_id`、`block_id`、`subblock_id` 和从零开始的
+`instance_op_sequence`。早期未拆分 IR 使用 `subblock_id=0`。
+`get_block_idx/get_block_num/get_subblock_idx` 返回当前身份/启动数量，记录为控制事件，
+不进入 tile 操作流。设备查询必须显式配置 `available_cluster_count` 或
+`available_aiv_count` 对应字段，不从运行解释器的机器推断默认值。
+
+`RuntimeScopeStmt` 记录 AUTO/MANUAL 模式及作用域嵌套。任务记录包含入口、实参、父任务、
+作用域、block 数量、predicate、显式依赖、实例、输出及完成状态/位置。循环重复启动生成
+新 TaskId。TaskId 数组支持函数式 create/get/update；`system.task_invalid` 表示无生产者，
+在依赖中跳过。未初始化数组元素或任意标量伪造的 TaskId 在被消费时出错。
+predicate 为假或 block 数为零时仍记录可被依赖引用的跳过任务，但不创建实例。
+编译器的返回值到参数分析用于保留既有输出绑定；无法确认时明确报错。
+正常启动的逻辑返回采用最后一个 block 的返回值，共享 Tensor 输出别名可见之前的全部写入。
+
+Tensor 创建、维度查询、元素读取及二维 slice 属于编排控制操作。Tensor slice 在任务间
+共享存储身份和版本。每个新 tile 记录 `owner_instance`；除显式视图别名外，存储独立。
+全部实例共用对象表和步数预算。功能模式创建的 Tensor 存储未初始化，kernel 必须先写后读；
+功能载荷 dtype 仍限 FP16/FP32。
+
+barrier、fence、syncall、set/wait flag、sync_src/sync_dst、sync_set/sync_wait 和
+set_ffts 求值参数后记录事件域、作用域、实例身份及下一个全局/实例操作位置，然后继续。
+局部同步列出当前实例；启动数量能确定参与范围的 syncall 列出逻辑 block。
+显式参与数量或无法解析的跨核域保留原始作用域，使用 `participants=null`，不推断硬件子核拓扑。
+两种模式均采用 `record_and_continue` 策略，因此依赖并发跨 block 数据交接的 kernel，
+其功能模式结果不构成同步语义参考。
+
+导出格式：
+
+| 文件 | 内容 |
+| ---- | ---- |
+| `manifest.json` | 格式版本、完成标记、实例到文件的映射 |
+| `tasks.json` | 启动记录及显式任务依赖 |
+| `events.jsonl` | 作用域、启动、完成、身份查询、编排及同步事件 |
+| `objects.json` | 最终全局对象描述，不含载荷 |
+| `capture_config.json` | 模式、设备查询配置、预算及捕获策略 |
+| `task_N_block_B_subblock_S.jsonl` | 单实例 tile 操作；无操作实例也生成空文件 |
+
+内存接口为 `result.trace/tasks/events/objects/capture_config`。存储依赖按捕获顺序
+保守跟踪整块分配的最近写入，显式任务依赖单独记录。范围级 hazard 与时间回放待实现。
+`capture_trace=False` 关闭操作/事件记录，但保留任务拓扑和执行效果，并写入配置。
+只应读取 manifest 列出的实例文件；重复导出目录可能留下旧的、未引用文件。
+完成 manifest 最后写入。失败运行不返回结果，诊断前缀保留在
+`interpreter.recorder.records` 和 `interpreter.capture`。
+
+从外层 workspace 运行：
+`PYTHONPATH=pypto/python .venv-ir/bin/python workspace/multicore-ir-review/run_capture.py`。
+脚本验收四 block SPMD 矩阵乘（16/24 条操作）和三个 MPMD 任务（8/10 条操作），
+核对数值、trace-only 输入不变、两种模式记录一致，以及重复导出文件逐字节稳定，
+在脚本旁的 `capture-output/` 保存捕获结果和 `verification.json`。

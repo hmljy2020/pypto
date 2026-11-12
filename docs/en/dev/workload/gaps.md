@@ -64,6 +64,11 @@ and a shared-resource budget. Replay derives cross-thread ordering from data
 and synchronization dependencies. Initial workloads should have deterministic,
 synchronized execution paths.
 
+Full-entry early Tile IR capture now emits logical block streams, task dependencies
+and synchronization events; see [multicore capture](plan.md#full-entry-multicore-capture).
+It uses deterministic capture order and records synchronization without blocking.
+Physical placement, concurrent synchronization semantics and timed scheduling remain open.
+
 WSE's compute and bandwidth figures are whole-core budgets. The configuration
 must state how those budgets are distributed across PEs and which resources
 remain shared.

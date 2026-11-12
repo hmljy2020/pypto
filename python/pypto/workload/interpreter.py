@@ -19,6 +19,8 @@ import torch
 from pypto import DataType
 from pypto.pypto_core import ir as _ir
 
+from .capture import CaptureRuntime, Launch, TaskId, json_value
+from .control import control_ops
 from .ops import default_ops
 from .runtime import DTYPE_NAMES, DTYPES, ObjectRuntime, OpResult, RuntimeObject, TensorSpec, UnknownValue
 from .trace import ExecutionResult, TraceRecorder
@@ -61,6 +63,8 @@ class _Transfer(Exception):
 
 
 def _unwrap(value: Any, mode: str, context: str) -> Any:
+    if isinstance(value, TaskId):
+        return json_value(value)
     if isinstance(value, RuntimeObject):
         if mode == "trace_only":
             return value.describe()
@@ -76,33 +80,34 @@ def _unwrap(value: Any, mode: str, context: str) -> Any:
     return value
 
 
-def _json_value(value: Any) -> Any:
-    if isinstance(value, RuntimeObject):
-        return {"object_id": value.object_id, "version": value.version}
-    if isinstance(value, UnknownValue):
-        return {"unknown_sources": list(value.sources)}
-    if isinstance(value, (list, tuple)):
-        return [_json_value(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _json_value(v) for k, v in value.items()}
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return str(value)
-
-
 class TileInterpreter:
     """Execute IR semantics with optional numerical handlers and trace capture.
 
     Args:
         max_steps: Maximum evaluated expressions/statements per run. An empty
             loop also consumes steps; calls share the same budget.
+        capture_config: Explicit positive device query values, keyed by
+            available_cluster_count or available_aiv_count. No device defaults
+            are inferred from the machine running the interpreter.
     """
 
-    def __init__(self, max_steps: int = 1_000_000) -> None:
+    def __init__(
+        self, max_steps: int = 1_000_000, *, capture_config: Mapping[str, int] | None = None
+    ) -> None:
         if type(max_steps) is not int or max_steps <= 0:
             raise ValueError(f"max_steps must be a positive integer, got {max_steps}")
         self.max_steps = max_steps
         self.registry: dict[str, tuple[OpHandler, ComputeHandler | None]] = default_ops()
+        self.registry.update(control_ops())
+        self.capture_config = dict(capture_config or {})
+        allowed = {"available_cluster_count", "available_aiv_count"}
+        if set(self.capture_config) - allowed:
+            raise ValueError(
+                f"Unknown capture configuration fields: {sorted(set(self.capture_config) - allowed)}"
+            )
+        for key, value in self.capture_config.items():
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"capture_config[{key!r}] must be a positive integer, got {value!r}")
         self.env: dict[int, Any] = {}
         self.function = "<entry>"
         self.steps = 0
@@ -111,6 +116,8 @@ class TileInterpreter:
         self.mode = "trace_only"
         self.next_op_id = 0
         self._active_call: tuple[_ir.Call, dict[str, Any]] | None = None
+        self.call_stack: list[str] = []
+        self.capture = CaptureRuntime(self, False)
 
     def register_op(self, name: str, *, semantics: OpHandler, compute: ComputeHandler | None = None) -> None:
         """Register semantics and an optional numerical implementation.
@@ -148,6 +155,8 @@ class TileInterpreter:
         self.program = program
         self.objects, self.recorder = ObjectRuntime(), TraceRecorder(capture_trace)
         self.env, self.steps, self.function = {}, 0, entry
+        self.call_stack, self._active_call = [], None
+        self.capture = CaptureRuntime(self, capture_trace)
         fn = program.get_function(entry)
         if fn is None:
             raise InterpreterError(f"Entry function {entry!r} not found")
@@ -178,11 +187,32 @@ class TileInterpreter:
         if set(inputs) != used:
             raise InterpreterError(f"{entry}: unexpected inputs {sorted(set(inputs) - used)}")
         with torch.no_grad():
-            outputs = self._invoke(fn, tuple(values))
+            if self._is_orchestration(fn):
+                outputs = self._invoke(fn, tuple(values))
+            else:
+                try:
+                    outputs, _ = self.capture.launch(fn, tuple(values), Launch(), fn)
+                except Exception as error:
+                    raise InterpreterError(str(error)) from error
         return ExecutionResult(
             tuple(_unwrap(v, self.mode, f"return in {entry} at {fn.span}") for v in outputs),
             self.recorder.records,
             self.mode,
+            self.capture.tasks,
+            self.capture.events.records,
+            {
+                "format_version": 1,
+                "complete": True,
+                "entry": entry,
+                "capture_trace": capture_trace,
+                "max_steps": self.max_steps,
+                "device": dict(self.capture_config),
+                "scheduling_policy": "launch_encounter_order_then_ascending_block_id",
+                "synchronization_policy": "record_and_continue",
+                "storage_dependency_policy": "whole_storage_in_capture_order",
+                "subblock_policy": "unsplit_zero",
+            },
+            [obj.describe() for obj in self.objects.objects],
         )
 
     def _tick(self, node: Any) -> None:
@@ -198,8 +228,9 @@ class TileInterpreter:
     def _invoke(self, fn: _ir.Function, args: tuple[Any, ...]) -> tuple[Any, ...]:
         previous_env, previous_function = self.env, self.function
         self.env, self.function = {}, fn.name
+        self.call_stack.append(fn.name)
         try:
-            unknown = set(fn.attrs) - {"mx_tensor_views_blocked"}
+            unknown = set(fn.attrs) - {"mx_tensor_views_blocked", "spmd_unwrapped", "core_num", "sync_start"}
             if unknown:
                 raise InterpreterError(
                     f"{fn.name} at {fn.span}: unsupported function attributes {sorted(unknown)}"
@@ -219,6 +250,7 @@ class TileInterpreter:
                 raise InterpreterError(f"{fn.name}: missing return")
             return ()
         finally:
+            self.call_stack.pop()
             self.env, self.function = previous_env, previous_function
 
     def evaluate_attribute(self, value: Any) -> Any:
@@ -263,7 +295,9 @@ class TileInterpreter:
             raise ValueError(f"Unsupported tile padding {view.pad}")
         # Layout is logical metadata, not an instruction to pack the CPU tensor.
         layout = {k: str(getattr(view, k)) for k in ("blayout", "slayout", "fractal", "pad", "compact")}
-        return self.objects.create(TensorSpec(shape, typ.dtype), "tile", valid, space, layout)
+        obj = self.objects.create(TensorSpec(shape, typ.dtype), "tile", valid, space, layout)
+        obj.owner_instance = self.capture.identity()
+        return obj
 
     def payload(self, obj: RuntimeObject) -> torch.Tensor:
         """Require an existing numerical payload (errors gain consumer context)."""
@@ -284,7 +318,12 @@ class TileInterpreter:
 
     def unknown(self, call: _ir.Call) -> UnknownValue:
         """Describe a payload-dependent scalar from the current operation."""
-        return UnknownValue((f"{call.op.name} (op {self.next_op_id}) in {self.function} at {call.span}",))
+        return UnknownValue(
+            (
+                f"{call.op.name} (before op {self.next_op_id}, task/block {self.capture.identity()}) "
+                f"in {self.function} at {call.span}",
+            )
+        )
 
     def concrete(self, value: Any, node: Any, purpose: str) -> Any:
         """Reject unknown scalars only where execution needs a concrete value."""
@@ -307,6 +346,15 @@ class TileInterpreter:
         return UnknownValue(sources) if sources else None
 
     def evaluate(self, expr: _ir.Expr) -> Any:
+        try:
+            return self._evaluate(expr)
+        except Exception as error:
+            raise InterpreterError(
+                f"task/block {self.capture.identity()}, {type(expr).__name__} in "
+                f"{self.function} at {expr.span}: {error}"
+            ) from error
+
+    def _evaluate(self, expr: _ir.Expr) -> Any:
         self._tick(expr)
         if isinstance(expr, _ir.Var):
             return self.env[expr.unique_id]
@@ -340,34 +388,102 @@ class TileInterpreter:
             if expr.type.dtype.is_float():
                 return float(value)
             return int(value)
-        if isinstance(expr, _ir.Call):
+        if isinstance(expr, (_ir.Call, _ir.Submit)):
             return self._call(expr)
 
         raise InterpreterError(
             f"{self.function} at {expr.span}: unsupported expression {type(expr).__name__}"
         )
 
-    def _call(self, expr: _ir.Call) -> Any:
+    @staticmethod
+    def _is_orchestration(fn: _ir.Function) -> bool:
+        return fn.func_type in {_ir.FunctionType.Orchestration, _ir.FunctionType.Graph} or (
+            fn.func_type == _ir.FunctionType.Opaque and fn.role == _ir.Role.Orchestrator
+        )
+
+    def _function_call(self, expr: _ir.Call | _ir.Submit, args: tuple[Any, ...]) -> Any:
+        fn = self.program.get_function(expr.op.name)
+        if fn is None:
+            raise ValueError(f"Unknown function {expr.op.name}")
+        attrs = self.evaluate_attribute(dict(expr.attrs))
+        kwargs = self.evaluate_attribute(dict(expr.kwargs))
+        if kwargs:
+            raise ValueError(f"Unsupported function keyword arguments: {sorted(kwargs)}")
+        allowed = {"core_num", "sync_start", "predicate", "deps", "arg_directions", "allow_early_resolve"}
+        if set(attrs) - allowed:
+            raise ValueError(f"Unsupported call attributes: {sorted(set(attrs) - allowed)}")
+        caller = self.program.get_function(self.function)
+        is_submit = isinstance(expr, _ir.Submit)
+        kernel_types = {
+            _ir.FunctionType.InCore,
+            _ir.FunctionType.AIC,
+            _ir.FunctionType.AIV,
+            _ir.FunctionType.Spmd,
+            _ir.FunctionType.Group,
+            _ir.FunctionType.Graph,
+        }
+        orchestration = self._is_orchestration(caller)
+        launch = (
+            is_submit
+            or bool(set(attrs) & (allowed - {"arg_directions"}))
+            or (orchestration and (fn.func_type in kernel_types or fn.role == _ir.Role.SubWorker))
+        )
+        if launch:
+            if is_submit:
+                core_num = self.evaluate(expr.core_num) if expr.core_num is not None else 1
+            elif "core_num" in attrs:
+                core_num = attrs["core_num"]
+            else:
+                core_num = self.evaluate_attribute(fn.attrs.get("core_num", 1))
+            predicate = (
+                self.evaluate(expr.predicate)
+                if is_submit and expr.predicate is not None
+                else attrs.get("predicate", True)
+            )
+            dependencies = (
+                tuple(self.evaluate(dep) for dep in expr.deps) if is_submit else attrs.get("deps", ())
+            )
+            self.concrete((core_num, predicate, dependencies), expr, "task launch")
+            spec = Launch(
+                core_num=core_num,
+                sync_start=expr.sync_start
+                if is_submit
+                else attrs.get("sync_start", fn.attrs.get("sync_start", False)),
+                predicate=predicate,
+                dependencies=self.capture.dependencies(dependencies),
+                allow_early_resolve=expr.allow_early_resolve
+                if is_submit
+                else attrs.get("allow_early_resolve", False),
+            )
+            values, task_id = self.capture.launch(fn, args, spec, expr)
+            if is_submit:
+                return (*values, task_id) if values else task_id
+        else:
+            values = self._invoke(fn, args)
+        return values[0] if len(values) == 1 else values
+
+    def _call(self, expr: _ir.Call | _ir.Submit) -> Any:
         previous_call = self._active_call
         try:
             args = tuple(self.evaluate(v) for v in expr.args)
             if isinstance(expr.op, _ir.GlobalVar):
-                fn = self.program.get_function(expr.op.name)
-                if fn is None:
-                    raise ValueError(f"Unknown function {expr.op.name}")
-                values = self._invoke(fn, args)
-                return values[0] if len(values) == 1 else values
+                return self._function_call(expr, args)
+            if isinstance(expr, _ir.Submit):
+                raise ValueError("Submit requires a GlobalVar callee")
             handlers = self.registry.get(expr.op.name)
             if handlers is None:
                 raise ValueError("No registered semantics implementation")
             semantics, compute = handlers
-            self.concrete(args, expr, f"{expr.op.name} instruction arguments")
+            # Arrays can carry uninitialized slots until consumed. Indexes and
+            # dependency lists are checked at their actual point of use.
+            if not expr.op.name.startswith("array."):
+                self.concrete(args, expr, f"{expr.op.name} instruction arguments")
             kwargs = self.evaluate_attribute(dict(expr.kwargs))
             self._active_call = (expr, kwargs)
             before = {obj.object_id: obj.describe() for obj in self.objects.objects}
             parameters = {
-                "args": _json_value(args),
-                "kwargs": _json_value(kwargs),
+                "args": json_value(args),
+                "kwargs": json_value(kwargs),
             }
             result = semantics(self, expr, args)
             if not isinstance(result, OpResult):
@@ -379,7 +495,8 @@ class TileInterpreter:
                 for obj in result.reads:
                     self.payload(obj)
                 compute(self, expr, args, result)
-                self.concrete(result.value, expr, f"{expr.op.name} functional result")
+                if not expr.op.name.startswith("array."):
+                    self.concrete(result.value, expr, f"{expr.op.name} functional result")
             self._finish(expr, result, before, parameters)
             return result.value
         except Exception as error:
@@ -395,6 +512,18 @@ class TileInterpreter:
         parameters: dict[str, Any],
     ) -> None:
         """Advance effects independently of whether the recorder is enabled."""
+        if result.control_kind is not None:
+            if result.reads or result.writes or result.views:
+                raise ValueError("Control results cannot carry tile storage effects")
+            self.capture.event(
+                result.control_kind,
+                call,
+                ir_op=call.op.name,
+                parameters={**parameters, **json_value(result.parameters)},
+                result=json_value(result.value),
+                objects=[result.value.describe()] if isinstance(result.value, RuntimeObject) else [],
+            )
+            return
         op_id = self.next_op_id
         reads = [before[obj.object_id] for obj in result.reads]
         dependencies = {
@@ -422,16 +551,20 @@ class TileInterpreter:
         self.recorder.record(
             {
                 "op_id": op_id,
+                **self.capture.identity(),
+                "instance_op_sequence": self.capture.current.op_sequence if self.capture.current else None,
                 "ir_op": call.op.name,
                 "pto_op": result.pto_op,
                 "function": self.function,
                 "location": str(call.span),
-                "parameters": {**parameters, **_json_value(result.parameters)},
+                "parameters": {**parameters, **json_value(result.parameters)},
                 "inputs": reads,
                 "outputs": [obj.describe() for obj in (*writes, *result.views)],
                 "dependencies": sorted(dependencies),
             }
         )
+        if self.capture.current is not None:
+            self.capture.current.op_sequence += 1
 
     def _body_values(self, body: _ir.Stmt) -> tuple[Any, ...]:
         try:
@@ -443,6 +576,17 @@ class TileInterpreter:
         return ()
 
     def _execute(self, stmt: _ir.Stmt) -> None:
+        try:
+            self._execute_stmt(stmt)
+        except _Transfer:
+            raise
+        except Exception as error:
+            raise InterpreterError(
+                f"task/block {self.capture.identity()}, {type(stmt).__name__} in "
+                f"{self.function} at {stmt.span}: {error}"
+            ) from error
+
+    def _execute_stmt(self, stmt: _ir.Stmt) -> None:
         self._tick(stmt)
         if isinstance(stmt, _ir.SeqStmts):
             for child in stmt.stmts:
@@ -461,35 +605,44 @@ class TileInterpreter:
             body = stmt.then_body if condition else stmt.else_body
             self._bind(stmt.return_vars, self._body_values(body) if body is not None else ())
         elif isinstance(stmt, (_ir.ForStmt, _ir.WhileStmt)):
-            values = tuple(self.evaluate(v.initValue) for v in stmt.iter_args)
-            self._bind(stmt.iter_args, values)
-            if isinstance(stmt, _ir.ForStmt):
-                if stmt.kind != _ir.ForKind.Sequential:
-                    raise InterpreterError(f"{self.function}: only sequential for loops are supported")
-                iterator = iter(
-                    range(
-                        *(
-                            self.concrete(self.evaluate(v), stmt, "for loop bound")
-                            for v in (stmt.start, stmt.stop, stmt.step)
-                        )
-                    )
-                )
-            while True:
-                self._tick(stmt)
-                if isinstance(stmt, _ir.ForStmt):
-                    try:
-                        index = next(iterator)
-                    except StopIteration:
-                        break
-                    self.env[stmt.loop_var.unique_id] = index
-                elif not self.concrete(self.evaluate(stmt.condition), stmt, "while condition"):
-                    break
-                values = self._body_values(stmt.body)
-                self._bind(stmt.iter_args, values)
-            self._bind(stmt.return_vars, values)
+            self._execute_loop(stmt)
+        elif isinstance(stmt, _ir.RuntimeScopeStmt):
+            self.capture.enter_scope(stmt)
+            try:
+                self._execute(stmt.body)
+            finally:
+                self.capture.leave_scope(stmt)
         elif type(stmt) is _ir.ScopeStmt or isinstance(stmt, (_ir.InCoreScopeStmt, _ir.HierarchyScopeStmt)):
             self._execute(stmt.body)
         else:
             raise InterpreterError(
                 f"{self.function} at {stmt.span}: unsupported statement {type(stmt).__name__}"
             )
+
+    def _execute_loop(self, stmt: _ir.ForStmt | _ir.WhileStmt) -> None:
+        values = tuple(self.evaluate(v.initValue) for v in stmt.iter_args)
+        self._bind(stmt.iter_args, values)
+        if isinstance(stmt, _ir.ForStmt):
+            if stmt.kind != _ir.ForKind.Sequential:
+                raise InterpreterError(f"{self.function}: only sequential for loops are supported")
+            iterator = iter(
+                range(
+                    *(
+                        self.concrete(self.evaluate(v), stmt, "for loop bound")
+                        for v in (stmt.start, stmt.stop, stmt.step)
+                    )
+                )
+            )
+        while True:
+            self._tick(stmt)
+            if isinstance(stmt, _ir.ForStmt):
+                try:
+                    index = next(iterator)
+                except StopIteration:
+                    break
+                self.env[stmt.loop_var.unique_id] = index
+            elif not self.concrete(self.evaluate(stmt.condition), stmt, "while condition"):
+                break
+            values = self._body_values(stmt.body)
+            self._bind(stmt.iter_args, values)
+        self._bind(stmt.return_vars, values)

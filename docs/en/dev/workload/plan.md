@@ -1,6 +1,6 @@
 # PyPTO workload plan
 
-Design notes · 2026-11-11 · CPU interpreter implemented; timing replay planned
+Design notes · 2026-11-12 · CPU interpreter and multicore capture implemented; timing replay planned
 
 The goal is to turn PyPTO operators into workloads for a WSE system with
 superscalarNPU cores. The first milestone is a single-thread, single-PE model
@@ -239,11 +239,11 @@ Each event contains its zero-based ID, IR/PTO names, function/source location,
 concrete args/kwargs, input/output snapshots and direct producer dependencies.
 Load/store include Tensor ID and offsets. Initial inputs have version zero and no
 producer; every operation write advances its version, including a new tile's first
-write. These are single-thread dependencies, not a complete scheduling/alias model.
+write. These dependencies follow capture order across instances; they are not a complete scheduling/alias model.
 The execution engine owns IDs, versions and producers; the recorder only saves
 snapshots. Identical supported IR and input descriptions produce identical traces
 in both modes when both modes follow the same control-flow path. JSONL is the current
-export; manifest/object sidecars and timing replay remain future work.
+operation export; `write_capture` adds manifest/object sidecars. Timing replay remains future work.
 
 Extensions register two separate entry points:
 
@@ -290,3 +290,92 @@ functional traces and exact integer-input numerical results, and exports JSONL u
 `tests/ut/workload/test_interpreter.py` also checks random-input accuracy, zero tile
 payload allocation in trace-only mode, unchanged Tensor inputs, unknown-value errors,
 short circuiting, partial/non-contiguous accesses, snapshots and registry isolation.
+
+## Full-entry multicore capture
+
+The interpreter can execute an entire orchestration entry at both
+`ConvertTensorToTileOps` and `InferTileMemorySpace`. Capture runs launches in
+encounter order, each to completion, and logical blocks in ascending ID order.
+Nested launches execute immediately, with a parent task/instance reference.
+This deterministic traversal produces workloads; it does not simulate device
+concurrency, deadlocks, flag matching, or barrier visibility.
+
+```python
+interpreter = TileInterpreter(capture_config={"available_aiv_count": 48})
+result = interpreter.run(program, entry="main", inputs=inputs)
+result.write_capture("workspace/multicore-ir-review/capture-output/example")
+result.write_trace("workspace/multicore-ir-review/merged.jsonl")
+```
+
+Plain `Submit` creates one block; `Submit.core_num` and launch attributes on
+`Call` create the requested number of blocks. Counts can be expressions in the
+caller frame. Orchestration/Graph calls to InCore, AIC, AIV, Spmd, Group or Graph
+functions create tasks. Spmd and Group bodies inherit their launched instance,
+so their ordinary kernel calls do not expand the grid a second time. Graph tasks
+contain orchestration and can launch child tasks. Ordinary helper calls inherit
+identity while creating independent variable frames. Direct kernel entry uses
+one task with one block. Legacy function-level launch attributes are accepted on
+calls, with call-site values taking precedence.
+
+Each operation retains its global `op_id` and adds `task_id`, `block_id`,
+`subblock_id` and zero-based `instance_op_sequence`. Early unsplit IR uses
+`subblock_id=0`. `get_block_idx/get_block_num/get_subblock_idx` return the current
+identity/launch size and produce control events, not tile operations. Device
+queries require the exact `available_cluster_count` or `available_aiv_count`
+configuration field; there is no inferred hardware default.
+
+`RuntimeScopeStmt` records AUTO/MANUAL modes and nested scope IDs. Task records
+contain entry, arguments, parent, scope, launch count, predicate, explicit
+dependencies, instances, outputs and completion status/position. Repeated loop
+launches receive fresh IDs. TaskId arrays support functional create/get/update;
+`system.task_invalid` is the no-producer sentinel and is ignored in dependencies.
+Uninitialized array entries or arbitrary scalar TaskIds fail when consumed.
+A false predicate or zero blocks records a skipped task with no instances; it
+still has a TaskId usable by consumers. Existing output bindings are recovered
+using the compiler's return-to-parameter analysis. Ambiguous skipped returns fail.
+For non-skipped launches, the logical return is the last block's return; shared
+Tensor output aliases observe all preceding writes.
+
+Tensor creation, dimension queries, element reads and two-dimensional slices are
+control operations. Tensor slices keep shared storage/version identity across
+tasks. Each new tile records `owner_instance`; its storage is private unless an
+explicit view aliases it. All instances share the object table and step budget.
+Functional Tensor creation allocates uninitialized storage: kernels must write
+it before reading. Functional payload dtypes retain the FP16/FP32 restriction.
+
+Barrier, fence, syncall, set/wait flag, sync_src/sync_dst, sync_set/sync_wait and
+set_ffts record parameters, domain, scope, identity and the next global/local
+operation position, then continue. Local synchronization lists its instance;
+launch-wide syncall lists logical blocks when the launch determines membership.
+Explicit participant counts and unresolved cross-core domains retain their raw
+scope and `participants=null`. No hardware subcore topology is inferred.
+Both modes use this `record_and_continue` policy. Functional results for kernels
+requiring concurrent cross-block handoff are therefore not a synchronization reference.
+
+The export contains:
+
+| File | Contents |
+| ---- | -------- |
+| `manifest.json` | Format version, completion marker and instance-to-file mapping |
+| `tasks.json` | Launch records and explicit task dependencies |
+| `events.jsonl` | Scope, launch, completion, identity, orchestration and sync events |
+| `objects.json` | Final global object descriptors, without payloads |
+| `capture_config.json` | Mode, device query configuration, budget and capture policies |
+| `task_N_block_B_subblock_S.jsonl` | Tile operations for one instance, including empty files |
+
+`result.trace`, `result.tasks`, `result.events`, `result.objects` and
+`result.capture_config` expose these records in memory. Storage dependencies
+conservatively follow the latest writer of the whole allocation in capture order;
+explicit task dependencies remain separate. Range-level hazards and timed replay
+remain future work. `capture_trace=False` suppresses operation/event recording but
+retains task topology and execution effects, and is recorded in configuration.
+Only manifest-listed instance files belong to an export; rewriting a directory
+can leave old, unreferenced files. The completion manifest is written last.
+Failed runs return no result and retain diagnostic prefixes in
+`interpreter.recorder.records` and `interpreter.capture`.
+
+Run `PYTHONPATH=pypto/python .venv-ir/bin/python workspace/multicore-ir-review/run_capture.py`
+from the enclosing workspace. It checks a four-block SPMD matmul (16/24 operations)
+and three MPMD tasks (8/10 operations) at the two checkpoints. It checks numerical
+results, unchanged trace-only inputs, mode-equivalent records and byte-stable
+exports, saving captures and `verification.json` under that script's `capture-output/`.

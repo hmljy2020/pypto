@@ -106,6 +106,7 @@ class RuntimeObject:
     index_map: dict[str, Any] | None = None
     view_of: int | None = None
     view_producer: int | None = None
+    owner_instance: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
         self.storage = StorageState(self.object_id)
@@ -144,6 +145,7 @@ class RuntimeObject:
             "index_map": deepcopy(self.index_map),
             "view_of": self.view_of,
             "view_producer": self.view_producer,
+            "owner_instance": deepcopy(self.owner_instance),
         }
 
 
@@ -155,6 +157,10 @@ class OpResult:
     Compute receives this result and fills payloads (or replaces an unknown scalar
     value). Views share storage without writing it. Neither handler may update
     identities, versions or producer links.
+
+    control_kind routes pure orchestration/synchronization to control events,
+    without consuming tile operation IDs. These results cannot carry storage
+    effects; Tensor descriptor creation is described in the event instead.
     """
 
     value: Any
@@ -163,6 +169,7 @@ class OpResult:
     pto_op: str | None = None
     parameters: dict[str, Any] = field(default_factory=dict)
     views: tuple[RuntimeObject, ...] = ()
+    control_kind: str | None = None
 
 
 class ObjectRuntime:
